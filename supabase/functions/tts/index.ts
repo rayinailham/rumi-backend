@@ -27,8 +27,8 @@ Deno.serve(async (req) => {
 
   const url = new URL(req.url);
   const parts = url.pathname.split("/").filter(Boolean);
-  // ["functions","v1","tts","<quote_id>"]
-  const quoteId = parts[3] ?? "";
+  const slugIdx = parts.indexOf("tts");
+  const quoteId = slugIdx >= 0 ? parts[slugIdx + 1] ?? "" : "";
   if (!UUID.test(quoteId)) {
     return jsonError(req, "invalid_input", "quote id is not a uuid", 400);
   }

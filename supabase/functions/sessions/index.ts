@@ -19,8 +19,10 @@ Deno.serve(async (req) => {
 
   const url = new URL(req.url);
   const parts = url.pathname.split("/").filter(Boolean);
-  // ["functions","v1","sessions", "<id>?"]
-  const id = parts[3] ?? null;
+  // Path can be "/sessions" or "/sessions/<id>" — depending on platform routing,
+  // it may also include the "/functions/v1/" prefix. Find the slug, take the next.
+  const slugIdx = parts.indexOf("sessions");
+  const id = slugIdx >= 0 ? parts[slugIdx + 1] ?? null : null;
 
   try {
     if (!id) {

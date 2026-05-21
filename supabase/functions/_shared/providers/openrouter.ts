@@ -58,7 +58,8 @@ async function* callOpenRouter(
   });
 
   if (!res.ok) {
-    throw new Error(`${res.status}_${model}`);
+    const errBody = await res.text().catch(() => "");
+    throw new Error(`${res.status}_${model}: ${errBody.slice(0, 150)}`);
   }
   if (!res.body) {
     throw new Error(`network_no_body_${model}`);
