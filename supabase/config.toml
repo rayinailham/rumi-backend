@@ -1,0 +1,12 @@
+project_id = "mstqmqxtqgmorqaynnpn"
+
+# Edge Functions — verify_jwt false because FE uses X-Device-Id only.
+# Each function validates the device header itself.
+[functions.sessions]
+verify_jwt = false
+
+[functions.tts]
+verify_jwt = false
+
+[functions.reflect]
+verify_jwt = false
