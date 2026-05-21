@@ -179,11 +179,15 @@ function parseFrame(frame) {
 }
 ```
 
-**Event order is fixed (contract §3.2):**
+**Event order is fixed (contract §3.2, v0.2):**
 ```
-session → user_message → quote → rumi_message → token×N → done
-                                                          \→ error (terminal)
+session → user_message → (quote | no_quote) → rumi_message → token×N → done
+                                                                       \→ error (terminal)
 ```
+
+`quote` and `no_quote` are mutually exclusive — exactly one fires per reflect.
+- `quote { id, quote_text, category, audio_url, similarity }` — verse matched.
+- `no_quote { reason: "no_match" }` — no verse passed similarity threshold. Rumi still streams a graceful response without an anchor verse. **Do NOT show this as an error**; just skip the quote card UI and let the tokens flow into the rumi bubble.
 
 Wire the `on(event, data)` callback to your store. Reference handler skeleton:
 
@@ -208,6 +212,10 @@ reflect({
         store.setActiveQuote(data)
         if (data.audio_url) playAudio(data.audio_url)
         else getQuoteAudio(data.id).then(r => r.audio_url && playAudio(r.audio_url))
+        break
+      case 'no_quote':
+        // {reason: 'no_match'}  — no verse this turn; Rumi still speaks
+        store.clearActiveQuote()
         break
       case 'rumi_message':
         // {id, status: 'streaming'}
