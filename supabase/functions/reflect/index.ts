@@ -1,7 +1,10 @@
 // /functions/v1/reflect  POST  text/event-stream
-// Pipeline (contract §3):
+// Pipeline (contract §3, v0.2 multi-turn):
 //   pre-stream: validate → rate-limit → ownership → embed
-//   stream: session → user_message → (no_match? error) → quote → rumi_message → token×N → done|error
+//   stream: session → user_message → (quote | no_quote) → rumi_message → token×N → done|error
+// Multi-turn: backend loads last N messages from session as chat history (v0.2).
+// no_quote: when no verse passes similarity threshold, Rumi still streams a graceful
+//           response without an anchor verse — not an error.
 // Abort (§3.5): persist partial content with status=interrupted, no done/error frame.
 
 import { preflight, corsHeaders } from "../_shared/cors.ts";
@@ -11,12 +14,17 @@ import { admin } from "../_shared/supabase.ts";
 import { checkRateLimit } from "../_shared/rate_limit.ts";
 import { embedText } from "../_shared/providers/gemini.ts";
 import { streamLLM } from "../_shared/providers/openrouter.ts";
-import { rumiSystemPrompt, rumiUserPrompt } from "../_shared/providers/prompts.ts";
+import {
+  rumiSystemPrompt,
+  rumiUserPromptWithQuote,
+  rumiUserPromptNoQuote,
+} from "../_shared/providers/prompts.ts";
 import { sseFrame } from "../_shared/sse.ts";
 
 const UUID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const MATCH_THRESHOLD = Number(Deno.env.get("RUMI_MATCH_THRESHOLD") ?? 0.5);
+const HISTORY_LIMIT = Number(Deno.env.get("RUMI_HISTORY_LIMIT") ?? 10);
 const FLUSH_MS = 500;
 
 interface ReflectBody {
@@ -249,7 +257,15 @@ async function runPipeline(
 
   if (aborted) return;
 
-  // 3. Match quote.
+  // 3. Match quote (best-effort; no_quote is graceful, not an error).
+  let quote: {
+    id: string;
+    quote_text: string;
+    category: string | null;
+    audio_url: string | null;
+    similarity: number;
+  } | null = null;
+
   const { data: matches, error: matchErr } = await sb.rpc("match_rumi_quotes", {
     query_embedding: ctx.embedding as unknown as string,
     match_threshold: MATCH_THRESHOLD,
@@ -268,40 +284,39 @@ async function runPipeline(
   }
 
   const top = Array.isArray(matches) && matches.length > 0 ? matches[0] : null;
-  if (!top) {
-    send("error", {
-      code: "no_match",
-      message: "no quote passed similarity threshold",
-      retriable: false,
-    });
-    closeStream();
-    return;
+  if (top) {
+    quote = {
+      id: top.id as string,
+      quote_text: top.quote_text as string,
+      category: (top.category ?? null) as string | null,
+      audio_url: (top.audio_url ?? null) as string | null,
+      similarity: Number(top.similarity ?? 0),
+    };
+    send("quote", quote);
+  } else {
+    // No verse passed threshold — Rumi will still respond, just unanchored.
+    send("no_quote", { reason: "no_match" });
   }
-
-  const quote = {
-    id: top.id as string,
-    quote_text: top.quote_text as string,
-    category: (top.category ?? null) as string | null,
-    audio_url: (top.audio_url ?? null) as string | null,
-    similarity: Number(top.similarity ?? 0),
-  };
-  send("quote", quote);
 
   if (aborted) return;
 
-  // 4. rumi_message.
+  // 4. rumi_message — quote fields only when a verse was found.
+  const rumiInsBody: Record<string, unknown> = {
+    session_id: session.id,
+    role: "rumi",
+    content: "",
+    status: "streaming",
+  };
+  if (quote) {
+    rumiInsBody.quote_id = quote.id;
+    rumiInsBody.quote_text = quote.quote_text;
+    rumiInsBody.category = quote.category;
+    rumiInsBody.audio_url = quote.audio_url;
+  }
+
   const rumiIns = await sb
     .from("messages")
-    .insert({
-      session_id: session.id,
-      role: "rumi",
-      content: "",
-      quote_id: quote.id,
-      quote_text: quote.quote_text,
-      category: quote.category,
-      audio_url: quote.audio_url,
-      status: "streaming",
-    })
+    .insert(rumiInsBody)
     .select("id")
     .single();
   if (rumiIns.error || !rumiIns.data) {
@@ -365,16 +380,46 @@ async function runPipeline(
 
   let llmFailed = false;
   try {
+    // Load chat history (multi-turn, contract §3.8). Excludes the user_message
+    // we just inserted (timestamp ordering keeps it after history's last row,
+    // since insert→select on user_message resolved before this query).
+    const { data: historyRows } = await sb
+      .from("messages")
+      .select("role, content, quote_text")
+      .eq("session_id", session.id)
+      .neq("id", userIns.data.id)
+      .neq("status", "error")
+      .order("created_at", { ascending: false })
+      .limit(HISTORY_LIMIT);
+    const history = (historyRows ?? []).slice().reverse(); // chronological
+
+    const historyTurns = history
+      .filter((m) => (m.content ?? "").trim().length > 0)
+      .map((m) => {
+        if (m.role === "user") {
+          return { role: "user" as const, content: m.content as string };
+        }
+        const verseLine = m.quote_text
+          ? `(verse referred to: "${m.quote_text}")\n`
+          : "";
+        return {
+          role: "assistant" as const,
+          content: `${verseLine}${m.content}`,
+        };
+      });
+
+    const currentUserPrompt = quote
+      ? rumiUserPromptWithQuote({
+        keresahan: ctx.keresahan,
+        quoteText: quote.quote_text,
+        category: quote.category,
+      })
+      : rumiUserPromptNoQuote({ keresahan: ctx.keresahan });
+
     const messages = [
       { role: "system" as const, content: rumiSystemPrompt() },
-      {
-        role: "user" as const,
-        content: rumiUserPrompt({
-          keresahan: ctx.keresahan,
-          quoteText: quote.quote_text,
-          category: quote.category,
-        }),
-      },
+      ...historyTurns,
+      { role: "user" as const, content: currentUserPrompt },
     ];
 
     for await (const delta of streamLLM({ messages, signal: abort.signal })) {
